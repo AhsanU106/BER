@@ -1,0 +1,248 @@
+import concurrent.futures
+import pypandoc
+import pandas as pd
+import dataframe_image as dfi
+import matplotlib.pyplot as plt
+
+from utils import run_sql_query, extract_json_from_output, replace_placeholders
+from config import llm
+
+import pandas as pd
+import dataframe_image as dfi
+
+import pandas as pd
+import os
+import shutil
+import dataframe_image as dfi
+
+import re
+
+def enforce_two_decimal_places(text):
+    """Format only numerical values in normal text, avoiding titles and table names."""
+    
+    # Split text into lines to process each separately
+    lines = text.split("\n")
+
+    def format_match(match):
+        num = float(match.group())  # Convert matched number to float
+        return f"{num:.2f}"  # Format to 2 decimal places
+
+    formatted_lines = []
+    for line in lines:
+        # Ignore formatting for section headers and image references
+        if line.startswith("#") or "![Table for" in line:
+            formatted_lines.append(line)
+        else:
+            # Apply regex-based number formatting to text lines only
+            formatted_line = re.sub(r"\b\d+\.\d+\b", format_match, line)
+            formatted_lines.append(formatted_line)
+
+    return "\n".join(formatted_lines)  # Reconstruct text
+
+# Define the folder to save images
+IMAGE_FOLDER = "tables"
+
+def format_numbers(obj):
+    """ Recursively format all numerical values to exactly 2 decimal places, handling all cases. """
+    if isinstance(obj, dict):
+        return {k: format_numbers(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [format_numbers(item) for item in obj]
+    elif isinstance(obj, (int, float)):
+        return "{:.2f}".format(float(obj))  # Ensure consistent float conversion & rounding
+    return obj
+
+
+def clean_image_folder():
+    """Deletes all existing images in the folder before saving new ones."""
+    if os.path.exists(IMAGE_FOLDER):
+        shutil.rmtree(IMAGE_FOLDER)  # Remove the folder and all its contents
+    os.makedirs(IMAGE_FOLDER)  # Recreate an empty folder
+
+def create_styled_table_image(data, filename="table.png", layout="multiple_rows"):
+    """
+    Create a styled table image from SQL result data.
+    
+    Parameters:
+      data: list of dicts from your SQL result.
+      filename: output PNG file name.
+      layout: "multiple_rows" to treat data as multiple rows or "transpose" for a single-row pivot.
+      
+    Returns:
+      The filename of the generated image.
+    """
+    if not data:
+        print("No data to create a table.")
+        return None
+
+    # If data is a single dict, wrap it in a list.
+    if isinstance(data, dict):
+        data = [data]
+
+    df = pd.DataFrame(data)
+
+    # Convert all possible numeric columns properly
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce')  # Force numbers, set invalid to NaN
+
+    # Drop rows that become completely NaN after conversion
+    df.dropna(how="all", inplace=True)
+
+    # If no valid rows remain, do not generate an image
+    if df.empty:
+        print("⚠ No valid rows remain after NaN removal. Skipping image generation.")
+        return None
+
+    # Prettify column names: replace underscores with spaces and title-case them.
+    df.columns = [col.replace("_", " ").strip().title() for col in df.columns]
+
+    if layout == "transpose":
+        if len(df) == 1:
+            df = df.T.reset_index()
+            df.columns = ["Metric", "Value"]
+        else:
+            print("⚠ layout='transpose' but data has multiple rows. Using as-is.")
+
+    # Identify numeric columns after full conversion
+    numeric_cols = df.select_dtypes(include='number').columns
+
+    # Apply a green gradient to numeric columns
+    styled_df = df.style.background_gradient(subset=numeric_cols, cmap='Greens')
+
+    # Set a fixed number of decimal places for numeric columns
+    styled_df = styled_df.format({col: "{:.2f}" for col in numeric_cols})
+
+    # Adjust table styles for better readability
+    styled_df.set_table_styles([
+        {"selector": "th", "props": [("font-size", "10pt"), ("font-weight", "bold"), ("text-align", "center"), ("background-color", "#D3D3D3")]},
+        {"selector": "td", "props": [("font-size", "10pt"), ("text-align", "center")]}
+    ], overwrite=False)
+
+    # Ensure filename is inside the folder
+    output_path = os.path.join(IMAGE_FOLDER, filename)
+
+    try:
+        # Override default max_rows to export all rows.
+        dfi.export(styled_df, output_path, max_rows=-1, max_cols=-1)
+        print(f"✅ Table image created: {output_path}")
+        return output_path
+    except Exception as e:
+        print("❌ Error exporting table image:", e)
+        return None
+
+# Run cleanup before generating new images
+clean_image_folder()
+
+
+def generate_section(section_name, section_details):
+    """Generate a single section of the report, including a table image at the end."""
+    print(f"Generating {section_name}...")
+    print("SECTION DETAILS:", section_details)
+
+    # 1) Extract data from SQL query or fallback to params
+    result_data = []
+    if section_details.get("query"):
+        raw_output = run_sql_query(section_details["query"])
+        # If raw_output is already a list of dicts, use it directly:
+        # result_data = extract_json_from_output(str(raw_output))  # <--- If needed
+        result_data = format_numbers(raw_output)
+    else:
+        result_data = section_details.get("params", [])
+
+    print("RESULT DATA:", result_data)
+
+    # 2) Generate textual content via LLM
+    #    (the same approach you already have)
+    # Make sure we have a 'fiscal_year' param to fill placeholders
+    placeholders = {"fiscal_year": "2023-24"}
+    filled_prompt = replace_placeholders(section_details["prompt"], placeholders)
+    strict_instruction = f"""
+You are generating a **formal, structured section** for a Budget Execution Report (BER).
+
+**DO NOT create any numerical values yourself. Use only the extracted SQL data.**
+- Ensure all placeholders are correctly replaced with real values.
+- DO NOT return raw code, tables, or placeholders.
+- Write a clear, well-structured, paragraph-based response.
+- Maintain a professional, analytical, and data-driven tone.
+- Follow the provided prompt exactly without adding extra sections.
+
+**Extracted Data for Reference:**
+{result_data}
+
+**Prompt to Follow:**
+{filled_prompt}
+"""
+    section_output = llm.generate_content(strict_instruction).text
+
+    # 3) Create a table image if we have data
+    table_md = ""
+    if isinstance(result_data, list) and len(result_data) > 0:
+        # Safe filename for the image
+        safe_section_name = section_name.replace(" ", "_").replace("/", "_")
+        table_filename = f"{safe_section_name}_table.png"
+
+        # Option A: If you want a multi-row table
+        # created_file = create_styled_table_image(result_data, table_filename, layout="multiple_rows")
+
+        # Option B: If it's a single dictionary or you want a transpose
+        # created_file = create_styled_table_image(result_data, table_filename, layout="transpose")
+
+        # For demonstration, let's assume multiple_rows by default:
+        created_file = create_styled_table_image(result_data, table_filename, layout="transpose")
+        
+
+        if created_file:
+            # Embed the image in Markdown
+            table_md = f"\n\n![Table for {section_name}]({created_file}){{width=35%}}\n\n"
+
+    # 4) Return combined text + table
+    return f"# {section_name}\n\n{section_output}\n\n{table_md}"
+
+
+def generate_report(sections):
+    """Generate the full report by processing all sections concurrently."""
+    if len(sections) < 1:
+        print("⚠️ Warning: The sections dictionary contains no sections.")
+        return
+
+    print(f"✅ {len(sections)} section(s) found. Proceeding with report generation...")
+
+    # 1) Generate all sections in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        section_md_list = list(executor.map(lambda item: generate_section(*item), sections.items()))
+
+    final_report_md = "".join(section_md_list)
+    print(final_report_md)
+
+    # 2) Prepend a custom title page
+    title_page_md = """
+<div style="text-align: center; margin-top: 250px;">
+  <h1 style="font-size: 48px; font-weight: bold;">Budget Execution Report</h1>
+  <h2 style="font-size: 36px; font-weight: bold;">Fiscal Year 2023-24</h2>
+  <p style="font-size: 18px;">December 2023</p>
+</div>
+
+<div style="page-break-after: always;"></div>
+"""
+    final_report_md = title_page_md + "".join(section_md_list)
+    final_report_md = enforce_two_decimal_places(final_report_md)  # Ensure all numbers are 2 dp
+
+
+    # 3) Write to a local .md file (optional, for debugging)
+    with open('final_report.md', 'w', encoding='utf-8') as file:
+        file.write(final_report_md)
+
+    # 4) Convert Markdown to DOCX (with a TOC)
+    try:
+        output_filename = "Budget_Execution_Report.docx"
+        extra_args = ['--toc', '--toc-depth=2']
+        pypandoc.convert_text(
+            final_report_md,
+            'docx',
+            format='md',
+            outputfile=output_filename,
+            extra_args=extra_args
+        )
+        print(f"Full Budget Execution Report generated successfully in {output_filename}!")
+    except Exception as e:
+        print("❌ Error during conversion to DOCX:", e)
